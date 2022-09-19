@@ -13,6 +13,8 @@ impl Packet for Handshake {
         _server: Arc<Mutex<Server>>,
         connection: &mut Connection,
     ) -> anyhow::Result<()> {
+        Self::read_packet(stream).await?;
+
         let _protocol_version = Self::read_varint(stream).await?;
         let _server_address = Self::read_string(stream).await?;
         let _server_port = Self::read_u16(stream).await?;

@@ -1,9 +1,9 @@
-use std::io::Cursor;
-
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SEGMENT_BITS: u8 = 0x7F;
 const CONTINUE_BIT: u8 = 0x80;
+
+// TODO: move these to packet module
 
 pub async fn read_varint<R: tokio::io::AsyncRead + std::marker::Unpin>(r: &mut R) -> std::io::Result<i32> {
     let mut value: i32 = 0;

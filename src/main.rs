@@ -2,19 +2,22 @@ pub mod packets;
 mod server;
 pub mod var_int;
 
-use std::sync::Arc;
-
+use aes::cipher::{AsyncStreamCipher, KeyIvInit};
 use async_mutex::Mutex;
 use mojang_api::ServerAuthResponse;
 use num_bigint::BigInt;
 use num_derive::FromPrimitive;
 use packets::{
-    handshake::Handshake, login_start::LoginStart, read_packet,
-    request_encryption::EncryptionRequest, response_encryption::EncryptionResponse, Packet,
+    handshake::Handshake, login_start::LoginStart, request_encryption::EncryptionRequest,
+    response_encryption::EncryptionResponse, Packet,
 };
 use server::Server;
 use sha1::Sha1;
-use tokio::{net::{TcpListener, TcpStream}, io::AsyncReadExt};
+use std::sync::Arc;
+use tokio::{
+    io::{AsyncReadExt},
+    net::{TcpListener, TcpStream},
+};
 
 use crate::packets::login_success::LoginSuccess;
 
@@ -39,26 +42,22 @@ async fn handle_client(mut stream: TcpStream, mc_server: Arc<Mutex<Server>>) -> 
     let mut connection = Connection::default();
 
     println!("handshake");
-    read_packet(&mut stream).await?;
     Handshake::handle(&mut stream, mc_server.clone(), &mut connection).await?;
     match connection.state {
         ConnectionState::Login => {
             // Login Packets
             println!("login_start");
-            read_packet(&mut stream).await?;
             LoginStart::handle(&mut stream, mc_server.clone(), &mut connection).await?;
             println!("encryption request");
             EncryptionRequest::handle(&mut stream, mc_server.clone(), &mut connection).await?;
             println!("encryption response");
-            read_packet(&mut stream).await?;
             EncryptionResponse::handle(&mut stream, mc_server.clone(), &mut connection).await?;
-
 
             // Auth
             println!("auth");
             let mut hasher = Sha1::new();
             hasher.update(" ".repeat(20).as_bytes());
-            hasher.update(&connection.shared_secret.as_ref().unwrap());
+            hasher.update(&connection.aes_cryptor.as_ref().unwrap().shared_secret.unwrap());
             hasher.update(&mc_server.lock().await.encoded_public_key);
             let output = hasher.digest().bytes();
             let bigint = BigInt::from_signed_bytes_be(&output);
@@ -69,7 +68,7 @@ async fn handle_client(mut stream: TcpStream, mc_server: Arc<Mutex<Server>>) -> 
                 ("serverId", &hash),
             ];
 
-            let res: ServerAuthResponse = mc_server
+            let _res: ServerAuthResponse = mc_server
                 .lock_arc()
                 .await
                 .http_client
@@ -80,28 +79,20 @@ async fn handle_client(mut stream: TcpStream, mc_server: Arc<Mutex<Server>>) -> 
                 .json()
                 .await?;
 
-            connection.user_uuid = Some(res.id.to_string());
-
-            LoginSuccess::handle(&mut stream,  mc_server.clone(), &mut connection).await?;
-
-            let mut maybe = [0; 10];
-            stream.read(&mut maybe).await?;
-            println!("???? {:?}", maybe);
+            LoginSuccess::handle(&mut stream, mc_server.clone(), &mut connection).await?;
 
             todo!("more stuff")
         }
         _ => panic!("unexpected state"),
     }
-
-    Ok(())
 }
 
 #[derive(Default)]
 pub struct Connection {
-    shared_secret: Option<Vec<u8>>,
     user_name: Option<String>,
-    user_uuid: Option<String>,
+    user_uuid: Option<u128>,
     state: ConnectionState,
+    aes_cryptor: Option<AesCryptor>,
 }
 
 #[derive(Default, FromPrimitive)]
@@ -111,4 +102,28 @@ enum ConnectionState {
     Status,
     Login,
     Play,
+}
+
+pub struct AesCryptor {
+    decryptor: cfb8::Decryptor<aes::Aes128>,
+    cryptor: cfb8::Encryptor<aes::Aes128>,
+    pub shared_secret: Option<[u8; 16]>,
+}
+
+impl AesCryptor {
+    pub fn new(key: [u8; 16], iv: [u8; 16]) -> Self {
+        Self {
+            decryptor: cfb8::Decryptor::new(&key.into(), &iv.into()),
+            cryptor: cfb8::Encryptor::new(&key.into(), &iv.into()),
+            shared_secret: Some(key),
+        }
+    }
+
+    pub fn decrypt(&self, buf: &mut [u8]) {
+        self.decryptor.clone().decrypt(buf);
+    }
+
+    pub fn encrypt(&self, buf: &mut [u8]) {
+        self.cryptor.clone().encrypt(buf);
+    }
 }

@@ -1,4 +1,4 @@
-use rsa::{RsaPrivateKey, RsaPublicKey, PublicKeyParts};
+use rsa::{PublicKeyParts, RsaPrivateKey, RsaPublicKey};
 
 pub struct Server {
     pub public_key: RsaPublicKey,
@@ -19,7 +19,7 @@ impl Server {
         );
 
         let http_client = reqwest::Client::new();
-        
+
         Ok(Self {
             private_key,
             public_key,

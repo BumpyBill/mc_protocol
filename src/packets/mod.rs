@@ -4,7 +4,7 @@ pub mod request_encryption;
 pub mod response_encryption;
 pub mod login_success;
 
-use crate::{server::Server, var_int, Connection};
+use crate::{server::{Server}, var_int, Connection, AesCryptor};
 use async_mutex::Mutex;
 use async_trait::async_trait;
 use num_traits::FromPrimitive;
@@ -13,6 +13,9 @@ use std::{
     sync::{Arc},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const VARINT_SEGMENT_BITS: u8 = 0x7F;
+const VARINT_CONTINUE_BIT: u8 = 0x80;
 
 #[async_trait]
 pub trait Packet {
@@ -33,14 +36,40 @@ pub trait Packet {
     async fn read_varint<R: tokio::io::AsyncRead + std::marker::Unpin + std::marker::Send>(
         stream: &mut R,
     ) -> std::io::Result<i32> {
-        Ok(var_int::read_varint(stream).await?)
+        let mut value: i32 = 0;
+
+        for position in (0..32).step_by(7) {
+            let buf = stream.read_u8().await?;
+    
+            value |= ((buf & VARINT_SEGMENT_BITS) as i32) << position;
+    
+            if buf & VARINT_CONTINUE_BIT == 0 {
+                break;
+            };
+        }
+    
+        return Ok(value);
     }
 
     async fn write_varint<W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send>(
         stream: &mut W,
-        value: i32,
+        mut number: i32,
     ) -> std::io::Result<()> {
-        var_int::write_varint(stream, value).await?;
+        while number & VARINT_SEGMENT_BITS as i32 != 0 {
+            let mut buf = (number & VARINT_SEGMENT_BITS as i32) as u8;
+    
+            let number_as_u32: u32 = {
+                let bytes = number.to_be_bytes();
+                u32::from_be_bytes(bytes)
+            };
+            number = (number_as_u32 >> 7) as i32;
+            if number != 0 {
+                buf |= VARINT_CONTINUE_BIT
+            }
+    
+            stream.write_u8(buf).await?;
+        }
+    
         Ok(())
     }
 
@@ -113,6 +142,21 @@ pub trait Packet {
         Ok(stream.read_u128().await?)
     }
 
+    async fn write_u128<W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send>(
+        stream: &mut W,
+        value: u128,
+    ) -> anyhow::Result<()> {
+        stream.write_u128(value).await?;
+        Ok(())
+    }
+
+    async fn write_u8<W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send>(
+        stream: &mut W,
+        value: u8,
+    ) -> anyhow::Result<()> {
+        stream.write_u8(value).await?;
+        Ok(())
+    }
 
     async fn read_i64<R: tokio::io::AsyncRead + std::marker::Unpin + std::marker::Send>(
         stream: &mut R,
@@ -140,41 +184,59 @@ pub trait Packet {
 
         Ok(bool[0] == 1)
     }
-}
 
-pub async fn read_packet<R: tokio::io::AsyncRead + std::marker::Unpin + std::marker::Send>(
-    stream: &mut R,
-) -> anyhow::Result<(usize, i32)> {
-    let packet_length = var_int::read_varint(stream).await? as usize;
-    let packet_id = var_int::read_varint(stream).await?;
+    async fn read_packet<R: tokio::io::AsyncRead + std::marker::Unpin + std::marker::Send>(
+        stream: &mut R,
+    ) -> anyhow::Result<(usize, i32)> {
+        let packet_length = var_int::read_varint(stream).await? as usize;
+        let packet_id = var_int::read_varint(stream).await?;
+    
+        // println!("{:?}", packet_length);
+        // println!("{:?}", packet_id);
+    
+        Ok((packet_length, packet_id))
+    }
+    
+    // TODO: make not shit
+    async fn write_packet<W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send>(
+        stream: &mut W,
+        packet_data: Cursor<Vec<u8>>,
+        packet_id: i32,
+    ) -> anyhow::Result<()> {
+        // create buffer
+        let mut packet = Cursor::new(Vec::new());
+        // write packet id
+        Self::write_varint(&mut packet, packet_id).await?;
+        // write packet data
+        packet.write(&packet_data.into_inner()).await?;
+        // write packet
+        Self::write_byte_vec(stream, packet.into_inner()).await?;
+    
+        Ok(())
+    }
 
-    // println!("{:?}", packet_length);
-    // println!("{:?}", packet_id);
-
-    Ok((packet_length, packet_id))
-}
-
-// TODO: make not shit
-pub async fn write_packet<W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send>(
-    stream: &mut W,
-    packet_data: Cursor<Vec<u8>>,
-    packet_id: i32,
-) -> anyhow::Result<()> {
-    // let mut packet_id_varint = Cursor::new(Vec::with_capacity(5));
-    // var_int::write_varint(&mut packet_id_varint, packet_id)?;
-    // let mut packet = Cursor::new(Vec::new());
-    // let packet_length = (raw_packet.position() + packet.position()) as i32;
-    // var_int::write_varint(&mut packet, packet_length)?;
-    // packet.write(&mut raw_packet.into_inner())?;
-    // stream.write(&mut packet.into_inner())?;
-
-    let mut packet = Cursor::new(Vec::with_capacity(170));
-    var_int::write_varint(&mut packet, packet_id).await?;
-    packet.write(&packet_data.into_inner()).await?;
-    let packet_length = packet.position() as i32;
-    // println!("write packet {}", packet_id);
-    var_int::write_varint(stream, packet_length).await?;
-    stream.write(&packet.into_inner()).await?;
-
-    Ok(())
+        // TODO: make not shit
+        async fn write_packet_encrypted<W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send>(
+            stream: &mut W,
+            packet_data: Cursor<Vec<u8>>,
+            packet_id: i32,
+            cryptor: &AesCryptor,
+        ) -> anyhow::Result<()> {
+            // create buffers
+            let mut packet = Cursor::new(Vec::new());
+            let mut plain = Cursor::new(Vec::new());
+            // write packet id
+            Self::write_varint(&mut packet, packet_id).await?;
+            // write packet data
+            packet.write(&packet_data.into_inner()).await?;
+            // write packet
+            Self::write_byte_vec(&mut plain, packet.into_inner()).await?;
+            // encrypt full packet (including length)
+            println!("{:?}", plain);
+            cryptor.encrypt(plain.get_mut());
+            println!("{:?}", plain);
+            stream.write(plain.get_ref()).await?;
+        
+            Ok(())
+        }
 }

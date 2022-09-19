@@ -13,6 +13,8 @@ impl Packet for LoginStart {
         _server: Arc<Mutex<Server>>,
         connection: &mut Connection,
     ) -> anyhow::Result<()> {
+        Self::read_packet(stream).await?;
+
         connection.user_name = Some(Self::read_string(stream).await?);
         let has_sig_data = Self::read_bool(stream).await?;
         if has_sig_data {
@@ -22,7 +24,9 @@ impl Packet for LoginStart {
         }
         let has_player_uuid = Self::read_bool(stream).await?;
         if has_player_uuid {
-            let _player_uuid = Self::read_u128(stream).await?;
+            connection.user_uuid = Some(Self::read_u128(stream).await?);
+        } else {
+            panic!("connection does not have a uuid");
         }
 
         Ok(())
